@@ -149,8 +149,6 @@ def process_per_dir(dir_with_index):
     for item in os.listdir(dir_path):
         item_path = os.path.join(dir_path, item)
         if os.path.isfile(item_path):
-            cursor = conn.cursor()
-
             cursor.execute("SELECT * FROM DEDUP WHERE PATH = ?", (item_path,))
             result = cursor.fetchone()
             if not result:
@@ -160,7 +158,6 @@ def process_per_dir(dir_with_index):
                 print(f"add {item_path}")
                 cursor.execute("INSERT INTO DEDUP (PATH, MTIME, MD5) VALUES (?, ?, ?)", (item_path, mtime, file_md5))
                 conn.commit()
-                cursor.close()
                 continue
             mtime = os.path.getmtime(item_path)
             if result[2] != mtime:
@@ -169,7 +166,6 @@ def process_per_dir(dir_with_index):
                 print(f"update {item_path}")
                 cursor.execute("UPDATE DEDUP SET MTIME = ?, MD5 = ? WHERE PATH = ?", (mtime, file_md5, item_path))
                 conn.commit()
-                cursor.close()
                 continue
             # 第二种情况，mtime、path均不变，没有更新，什么也不做
             print(f"nochange {item_path}")
