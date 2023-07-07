@@ -149,18 +149,19 @@ def process_per_dir(dir_with_index):
     for item in os.listdir(dir_path):
         item_path = os.path.join(dir_path, item)
         if os.path.isfile(item_path):
-            cursor.execute("SELECT * FROM DEDUP WHERE PATH = ?", (item_path,))
+            cursor.execute("SELECT MTIME FROM DEDUP WHERE PATH = ?", (item_path,))
             result = cursor.fetchone()
             if not result:
-                # 第一种情况，如果路径不存在，添加
+                # 第一种情况，如果MTIME不存在，添加
                 file_md5 = get_file_md5(item_path)
-                mtime = os.path.getmtime(item_path)
+                mtime = str(os.path.getmtime(item_path))
                 print(f"add {item_path}")
                 cursor.execute("INSERT INTO DEDUP (PATH, MTIME, MD5) VALUES (?, ?, ?)", (item_path, mtime, file_md5))
                 conn.commit()
                 continue
-            mtime = os.path.getmtime(item_path)
-            if result[2] != mtime:
+            mtime = str(os.path.getmtime(item_path))
+            # print(result, mtime)
+            if result[0] != mtime:
                 # 第二种情况，mtime发生改变，更新
                 file_md5 = get_file_md5(item_path)
                 print(f"update {item_path}")
@@ -171,28 +172,36 @@ def process_per_dir(dir_with_index):
             print(f"nochange {item_path}")
     cursor.close()
     conn.close()
-    print(f"[ {index}/{total} ] Dir: {dir}")
+    print(f"[ {index}/{total} ] Dir: {dir_path}")
 
 
-def handle_dedup(args):
+def handle_scan(args):
     begin_time = beijing_timestamp()
     workdir = os.path.abspath(args.workdir)
-    print(f"workdir {workdir}")
+    print(f"WORKDIR {workdir}")
 
     conn = sqlite3.connect(args.output)
     cursor = conn.cursor()
+
     # 判断表是否存在，支持多次执行
     cursor.execute(
         f"CREATE TABLE IF NOT EXISTS DEDUP ("
         f" ID INTEGER PRIMARY KEY AUTOINCREMENT, "
         f" PATH TEXT UNIQUE,"
-        f" MTIME REAL,"
-        f" MD5 TEXT"
+        f" MTIME TEXT NOT NULL,"
+        f" MD5 TEXT NOT NULL,"
+        f" PPATH TEXT"
         f")"
     )
+    # 创建MD5索引，没有必要创建PATH索引，因为UNIQUE约束本身就会创建一个唯一索引
+    cursor.execute(
+        f"CREATE INDEX IF NOT EXISTS MD5HASH ON DEDUP (MD5);"
+    )
+
     cursor.close()
     conn.close()
 
+    print(" scan ...")
     dir_list = get_all_directories(workdir)
     dir_with_index = []
     total = len(dir_list)
@@ -208,7 +217,21 @@ def handle_dedup(args):
     pool.join()
 
     end_time = beijing_timestamp()
-    print(f"handle download done! {begin_time} - {end_time}")
+    print(f"handle dedup scan done! {begin_time} - {end_time}")
+
+
+def handle_check(args):
+    begin_time = beijing_timestamp()
+
+    end_time = beijing_timestamp()
+    print(f"handle dedup check done! {begin_time} - {end_time}")
+
+
+def handle_clean(args):
+    begin_time = beijing_timestamp()
+
+    end_time = beijing_timestamp()
+    print(f"handle dedup clean done! {begin_time} - {end_time}")
 
 
 def main():
@@ -220,14 +243,29 @@ def main():
                         help="show program's version number and exit")
     parser.add_argument("-h", "--help", action="store_true",
                         help="show this help message and exit")
-    parser.add_argument("-w", "--workdir", default=".",
-                        help="setup workdir")
-    parser.add_argument("--output", default="dedup.db",
-                        help="dedup database file path")
-    parser.add_argument("-c", "--clean", action="store_true",
-                        help="clean duplicated file")
-    parser.add_argument("-j", "--job", default=os.cpu_count(), type=int,
-                        help="job count")
+
+    subparsers = parser.add_subparsers()
+
+    # 定义base命令用于集成
+    parent_parser = argparse.ArgumentParser(add_help=False, description="kdev - a tool for kernel development")
+    parent_parser.add_argument("-V", "--verbose", default=None, action="store_true", help="show verbose output")
+    parent_parser.add_argument("-j", "--job", default=os.cpu_count(), type=int, help="job count")
+    parent_parser.add_argument("-o", "--output", default="dedup.db", help="dedup database file path")
+    parent_parser.add_argument("-w", "--workdir", default=".", help="setup workdir")
+    parent_parser.add_argument('-l', '--log', default=None, help="log file path")
+    parent_parser.add_argument('-d', '--debug', default=None, action="store_true", help="enable debug output")
+
+    # 添加子命令 check
+    parser_check = subparsers.add_parser('check', parents=[parent_parser])
+    parser_check.set_defaults(func=handle_check)
+
+    # 添加子命令 scan
+    parser_scan = subparsers.add_parser('scan', parents=[parent_parser])
+    parser_scan.set_defaults(func=handle_scan)
+
+    # 添加子命令 clean
+    parser_clean = subparsers.add_parser('clean', parents=[parent_parser])
+    parser_clean.set_defaults(func=handle_clean)
 
     # 开始解析命令
     args = parser.parse_args()
@@ -238,11 +276,8 @@ def main():
     elif args.help or len(sys.argv) < 2:
         parser.print_help()
         sys.exit(0)
-    elif args.workdir is not None:
-        handle_dedup(args)
     else:
-        parser.print_help()
-        sys.exit(0)
+        args.func(args)
 
 
 if __name__ == "__main__":
