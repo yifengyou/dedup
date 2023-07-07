@@ -92,39 +92,19 @@ def get_file_md5(file_path):
         return md5.hexdigest()
 
 
-# 定义一个函数，递归遍历一个目录下的所有文件，并返回一个列表，每个元素是一个元组，包含文件路径和md5值
-def get_dir_files_md5(dir_path, conn):
-    for item in os.listdir(dir_path):
-        item_path = os.path.join(dir_path, item)
-        if os.path.isfile(item_path):
-            # 先判断数据库中是否存在记录，如果不存在，则计算MD5并写入
-            cursor = conn.cursor()
-
-            cursor.execute("SELECT * FROM DEDUP WHERE PATH = ?", (item_path,))
-            result = cursor.fetchone()
-            if not result:
-                # 第一种情况，如果路径不存在，添加
-                file_md5 = get_file_md5(item_path)
-                mtime = os.path.getmtime(item_path)
-                print(f"add {item_path}")
-                cursor.execute("INSERT INTO DEDUP (PATH, MTIME, MD5) VALUES (?, ?, ?)", (item_path, mtime, file_md5))
-                conn.commit()
-                cursor.close()
-                continue
-            mtime = os.path.getmtime(item_path)
-            if result[2] != mtime:
-                # 第二种情况，mtime发生改变，更新
-                file_md5 = get_file_md5(item_path)
-                print(f"update {item_path}")
-                cursor.execute("UPDATE DEDUP SET MTIME = ?, MD5 = ? WHERE PATH = ?", (mtime, file_md5, item_path))
-                conn.commit()
-                cursor.close()
-                continue
-            # 第二种情况，mtime、path均不变，没有更新，什么也不做
-            print(f"nochange {item_path}")
-        elif os.path.isdir(item_path):
-            # 如果是目录，递归调用自身，并将返回的列表扩展到结果列表中
-            get_dir_files_md5(item_path, conn)
+def get_file_inode(file_path):
+    try:
+        fstat = os.stat(file_path)
+    except FileNotFoundError:
+        print(f"File not found: {file_path}")
+        return -1
+    except PermissionError:
+        print(f"Permission denied: {file_path}")
+        return -2
+    except OSError as e:
+        print(f"System error: {e}")
+        return -3
+    return fstat.st_ino
 
 
 def get_all_directories(dir):
@@ -143,11 +123,14 @@ def get_all_directories(dir):
 def process_per_dir(dir_with_index):
     (index, total, db_file_path, dir_path) = dir_with_index
 
+    # print(f"process_per_dir {dir_path}")
     conn = sqlite3.connect(db_file_path)
     cursor = conn.cursor()
 
     for item in os.listdir(dir_path):
         item_path = os.path.join(dir_path, item)
+        # print(f"file path {item_path}")
+
         if os.path.isfile(item_path):
             cursor.execute("SELECT MTIME FROM DEDUP WHERE PATH = ?", (item_path,))
             result = cursor.fetchone()
@@ -155,8 +138,14 @@ def process_per_dir(dir_with_index):
                 # 第一种情况，如果MTIME不存在，添加
                 file_md5 = get_file_md5(item_path)
                 mtime = str(os.path.getmtime(item_path))
+                file_inode = get_file_inode(item_path)
+                if file_inode < 0:
+                    continue
                 print(f"add {item_path}")
-                cursor.execute("INSERT INTO DEDUP (PATH, MTIME, MD5) VALUES (?, ?, ?)", (item_path, mtime, file_md5))
+                cursor.execute(
+                    "INSERT INTO DEDUP (PATH, MTIME, MD5, INODE ) VALUES (?, ?, ?, ?)",
+                    (item_path, mtime, file_md5, file_inode)
+                )
                 conn.commit()
                 continue
             mtime = str(os.path.getmtime(item_path))
@@ -164,8 +153,14 @@ def process_per_dir(dir_with_index):
             if result[0] != mtime:
                 # 第二种情况，mtime发生改变，更新
                 file_md5 = get_file_md5(item_path)
+                file_inode = get_file_inode(item_path)
+                if file_inode < 0:
+                    continue
                 print(f"update {item_path}")
-                cursor.execute("UPDATE DEDUP SET MTIME = ?, MD5 = ? WHERE PATH = ?", (mtime, file_md5, item_path))
+                cursor.execute(
+                    "UPDATE DEDUP SET MTIME = ?, MD5 = ?, INODE = ?  WHERE PATH = ?",
+                    (mtime, file_md5, file_inode, item_path)
+                )
                 conn.commit()
                 continue
             # 第二种情况，mtime、path均不变，没有更新，什么也不做
@@ -190,6 +185,7 @@ def handle_scan(args):
         f" PATH TEXT UNIQUE,"
         f" MTIME TEXT NOT NULL,"
         f" MD5 TEXT NOT NULL,"
+        f" INODE INT NOT NULL,"
         f" PPATH TEXT"
         f")"
     )
@@ -205,6 +201,7 @@ def handle_scan(args):
     dir_list = get_all_directories(workdir)
     dir_with_index = []
     total = len(dir_list)
+    # print("dir total", total)
     for i, dir in enumerate(dir_list):
         dir = dir.strip()
         dir_with_index.append(
@@ -220,15 +217,125 @@ def handle_scan(args):
     print(f"handle dedup scan done! {begin_time} - {end_time}")
 
 
-def handle_check(args):
+def handle_stat(args):
     begin_time = beijing_timestamp()
 
+    workdir = os.path.abspath(args.workdir)
+    print(f"WORKDIR {workdir}")
+
+    db_file_path = os.path.abspath(args.output)
+    if not os.path.isfile(db_file_path):
+        perror(f" Database file {db_file_path} not found!")
+    print(f"using {db_file_path}")
+
+    conn = sqlite3.connect(args.output)
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT COUNT(*) FROM DEDUP")
+    except Exception:
+        print(f" Makesure {db_file_path} exists and file type ok")
+        cursor.close()
+        conn.close()
+        exit(1)
+
+    result = cursor.fetchone()
+    if result:
+        print(f"DEDUP 表格的记录数量为 {result[0]}")
+    else:
+        print("DEDUP 为空表，请先执行 ' dedup scan ' 生成数据")
+        exit(0)
+
+    try:
+        cursor.execute("SELECT COUNT(*) FROM DEDUP WHERE PPATH IS NOT NULL ")
+    except Exception:
+        print(f" Makesure {db_file_path} exists and file type ok")
+        cursor.close()
+        conn.close()
+        exit(1)
+
+    result = cursor.fetchone()
+    if result:
+        print(f"DEDUP 重复文件数量为 {result[0]}")
+    else:
+        print("没有发现重复的文件")
+
+    cursor.close()
+    conn.close()
+
     end_time = beijing_timestamp()
-    print(f"handle dedup check done! {begin_time} - {end_time}")
+    print(f"handle dedup stat done! {begin_time} - {end_time}")
+
+
+def process_per_dup(row_with_index):
+    (index, total, md5, count, db_file_path) = row_with_index
+
+    conn = sqlite3.connect(db_file_path)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT PATH, MTIME FROM DEDUP WHERE MD5 = ?", (md5,))
+    rows = cursor.fetchall()
+    # 打印这些记录的 PATH 和 MTIME 值
+    for row in rows:
+        print(f" -> PATH: {row[0]}, MTIME: {row[1]}")
+
+    cursor.close()
+    conn.close()
+    print(f"[ {index}/{total} ] : {md5} ({count})")
 
 
 def handle_clean(args):
     begin_time = beijing_timestamp()
+    workdir = os.path.abspath(args.workdir)
+    print(f"WORKDIR {workdir}")
+
+    db_file_path = os.path.abspath(args.output)
+    if not os.path.isfile(db_file_path):
+        perror(f" Database file {db_file_path} not found!")
+    print(f"using {db_file_path}")
+
+    conn = sqlite3.connect(args.output)
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT COUNT(*) FROM DEDUP")
+    except Exception:
+        print(f" Makesure {db_file_path} exists and file type ok")
+        cursor.close()
+        conn.close()
+        exit(1)
+    result = cursor.fetchone()
+    if result:
+        print(f"DEDUP 表格的记录数量为 {result[0]}")
+    else:
+        print("DEDUP 为空表，请先执行 ' dedup scan ' 生成数据")
+        exit(0)
+
+    sql_select = "SELECT MD5, COUNT(*) AS CNT FROM DEDUP WHERE PPATH IS NULL GROUP BY MD5 HAVING CNT > 1"
+    cursor.execute(sql_select)
+    rows = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+    total = len(rows)
+    if len(rows) < 1:
+        print("No duplicated file!")
+        exit(0)
+
+    print(" clean ...")
+
+    row_with_index = []
+    for i, row in enumerate(rows):
+        md5 = row[0]
+        count = row[1]
+        row_with_index.append(
+            (i + 1, total, md5, count, args.output)
+        )
+
+    pool = multiprocessing.Pool(args.job)
+    pool.imap_unordered(process_per_dup, row_with_index)
+    pool.close()
+    pool.join()
 
     end_time = beijing_timestamp()
     print(f"handle dedup clean done! {begin_time} - {end_time}")
@@ -255,9 +362,9 @@ def main():
     parent_parser.add_argument('-l', '--log', default=None, help="log file path")
     parent_parser.add_argument('-d', '--debug', default=None, action="store_true", help="enable debug output")
 
-    # 添加子命令 check
-    parser_check = subparsers.add_parser('check', parents=[parent_parser])
-    parser_check.set_defaults(func=handle_check)
+    # 添加子命令 stat
+    parser_stat = subparsers.add_parser('stat', parents=[parent_parser])
+    parser_stat.set_defaults(func=handle_stat)
 
     # 添加子命令 scan
     parser_scan = subparsers.add_parser('scan', parents=[parent_parser])
