@@ -290,24 +290,29 @@ def process_per_dup(row_with_index):
     rows = cursor.fetchall()
 
     first = None
+    changed_flag = False
     for row in rows:
         if first is None:
             first = row
             continue
-        # if row[1] != first[1] or row[3] is None:
-        # inode 不一致，但是md5一致，则硬链接
-        try:
-            safe_link(first[0], row[0])
-            cursor.execute(
-                "UPDATE DEDUP SET MTIME = ?, INODE = ?, PPATH = ?  WHERE PATH = ?",
-                (first[2], first[1], first[0], row[0])
-            )
-            conn.commit()
-        except Exception as e:
-            print(f" hard link failed! {str(e)}")
-            continue
-        print(f" -> clean PATH: {row[0]},  INODE: {row[1]}")
+        if row[1] != first[1]:
+            # inode 不一致，但是md5一致，则硬链接
+            try:
+                safe_link(first[0], row[0])
+            except Exception as e:
+                print(f" hard link failed! {str(e)}")
+                continue
+            print(f" -> Clean file {row[0]} [INODE: {row[1]}]")
+            changed_flag = True
 
+    if changed_flag:
+        # 复制好文件后一条语句完成SQL变更，避免了频繁变更SQL
+        # 如果有发生变更时候执行，否则不动
+        cursor.execute(
+            "UPDATE DEDUP SET MTIME = ?, INODE = ?, PPATH = ?  WHERE MD5 = ?",
+            (first[2], first[1], first[0], md5)
+        )
+        conn.commit()
     cursor.close()
     conn.close()
     print(f"[ {index}/{total} ] : {md5} ({count})")
