@@ -16,6 +16,7 @@ import os
 import hashlib
 import sqlite3
 import select
+import tempfile
 
 CURRENT_VERSION = "0.1.0"
 
@@ -137,10 +138,13 @@ def process_per_dir(dir_with_index):
             if not result:
                 # 第一种情况，如果MTIME不存在，添加
                 file_md5 = get_file_md5(item_path)
+
                 mtime = str(os.path.getmtime(item_path))
+
                 file_inode = get_file_inode(item_path)
                 if file_inode < 0:
                     continue
+
                 print(f"add {item_path}")
                 cursor.execute(
                     "INSERT INTO DEDUP (PATH, MTIME, MD5, INODE ) VALUES (?, ?, ?, ?)",
@@ -151,11 +155,13 @@ def process_per_dir(dir_with_index):
             mtime = str(os.path.getmtime(item_path))
             # print(result, mtime)
             if result[0] != mtime:
-                # 第二种情况，mtime发生改变，更新
+                # 第二种情况，MTIME发生改变，更新
                 file_md5 = get_file_md5(item_path)
+
                 file_inode = get_file_inode(item_path)
                 if file_inode < 0:
                     continue
+
                 print(f"update {item_path}")
                 cursor.execute(
                     "UPDATE DEDUP SET MTIME = ?, MD5 = ?, INODE = ?  WHERE PATH = ?",
@@ -163,7 +169,7 @@ def process_per_dir(dir_with_index):
                 )
                 conn.commit()
                 continue
-            # 第二种情况，mtime、path均不变，没有更新，什么也不做
+            # 第二种情况，MTIME、PATH均不变，没有更新，什么也不做
             print(f"nochange {item_path}")
     cursor.close()
     conn.close()
@@ -267,17 +273,40 @@ def handle_stat(args):
     print(f"handle dedup stat done! {begin_time} - {end_time}")
 
 
+def safe_link(src, dst):
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(dst)) as tmpdir:
+        tmpname = os.path.join(tmpdir, "tmp")
+        os.link(src, tmpname)
+        os.replace(tmpname, dst)
+
+
 def process_per_dup(row_with_index):
     (index, total, md5, count, db_file_path) = row_with_index
 
     conn = sqlite3.connect(db_file_path)
     cursor = conn.cursor()
 
-    cursor.execute("SELECT PATH, MTIME FROM DEDUP WHERE MD5 = ?", (md5,))
+    cursor.execute("SELECT PATH, INODE, MTIME, PPATH  FROM DEDUP WHERE MD5 = ?", (md5,))
     rows = cursor.fetchall()
-    # 打印这些记录的 PATH 和 MTIME 值
+
+    first = None
     for row in rows:
-        print(f" -> PATH: {row[0]}, MTIME: {row[1]}")
+        if first is None:
+            first = row
+            continue
+        # if row[1] != first[1] or row[3] is None:
+        # inode 不一致，但是md5一致，则硬链接
+        try:
+            safe_link(first[0], row[0])
+            cursor.execute(
+                "UPDATE DEDUP SET MTIME = ?, INODE = ?, PPATH = ?  WHERE PATH = ?",
+                (first[2], first[1], first[0], row[0])
+            )
+            conn.commit()
+        except Exception as e:
+            print(f" hard link failed! {str(e)}")
+            continue
+        print(f" -> clean PATH: {row[0]},  INODE: {row[1]}")
 
     cursor.close()
     conn.close()
@@ -322,6 +351,7 @@ def handle_clean(args):
         print("No duplicated file!")
         exit(0)
 
+    print(f"find duplicate {total} {rows}")
     print(" clean ...")
 
     row_with_index = []
